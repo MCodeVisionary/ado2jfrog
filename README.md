@@ -9,16 +9,11 @@ package versions (or latest-only with a flag).
 | `migrate_npm_to_jfrog.py` | npm (`.tgz`) | npm registry | npm local repo |
 | `migrate_nuget_to_jfrog.py` | NuGet (`.nupkg`) | NuGet v3 flat | NuGet local repo |
 
----
-
 ## Prerequisites
 
 - Python 3.9+
-- A virtual environment with `requests` installed (see [Setup](#setup))
 - An Azure DevOps **PAT** with `Packaging (read)` scope
 - A JFrog **Access Token** with deploy permissions on the target repo
-
----
 
 ## Setup
 
@@ -28,30 +23,20 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install requests
 ```
 
----
-
 ## Authentication
 
 Tokens are resolved in this order for each run:
 
-1. **CLI flag** — `--az-pat` / `--jfrog-token`
-2. **Environment variable** — `AZURE_PAT` / `JFROG_TOKEN` *(recommended)*
+1. **Environment variable** — `AZURE_PAT` / `JFROG_TOKEN` *(recommended)*
+2. **CLI flag** — `--az-pat` / `--jfrog-token`
 3. **Interactive prompt** — if neither of the above is set
-
-### Recommended: environment variables
 
 ```bash
 export AZURE_PAT="<your-azure-pat>"
 export JFROG_TOKEN="<your-jfrog-access-token>"
 ```
 
-Store these in a local `.env` file (already in `.gitignore`) and source it:
-
-```bash
-source .env
-```
-
----
+Store these in a local `.env` file (already in `.gitignore`) and source it before running.
 
 ## Usage
 
@@ -81,9 +66,7 @@ python3 migrate_nuget_to_jfrog.py \
 > `https://dev.azure.com/<org>/<project>/_artifacts/feed/<feed>`).
 > Omit it for org-scoped feeds.
 
----
-
-## All flags
+## Flags
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
@@ -100,8 +83,6 @@ python3 migrate_nuget_to_jfrog.py \
 | `--skip-upload` | No | false | Download only (dry run) |
 | `--clean` | No | false | Delete local files after successful upload |
 
----
-
 ## How it works
 
 **Phase 1 — Download** fetches the full package list from Azure Artifacts via
@@ -112,16 +93,3 @@ skipped (safe to re-run).
 **Phase 2 — Upload** pushes each file to Artifactory via a `PUT` request,
 preserving the standard registry path structure (`@scope/name/-/name-version.tgz`
 for scoped npm packages).
-
----
-
-## Files
-
-```
-.
-├── migrate_npm_to_jfrog.py    # npm migrator
-├── migrate_nuget_to_jfrog.py  # NuGet migrator
-├── README.md
-├── .gitignore                 # excludes .env, downloads/, .venv/
-└── .env                       # ← create this locally, never share it
-```
