@@ -1,6 +1,8 @@
 """
-Azure Artifacts → JFrog Artifactory NuGet Migrator
+Azure Artifacts → JFrog Artifactory Maven Migrator
 Supports both org-scoped and project-scoped Azure feeds.
+Downloads both .jar and .pom artifacts for each package version,
+preserving the standard Maven repository layout (groupId/artifactId/version/).
 
 Features:
   - Parallel downloads and uploads (--workers)
@@ -12,13 +14,13 @@ Requirements:
     pip install requests
 
 Usage:
-    python migrate_nuget_to_jfrog.py \
+    python migrate_maven_to_jfrog.py \
         --az-org        myorg \
         --az-project    myproject \
         --az-feed       myfeed \
         --az-pat        AZURE_PAT \
         --jfrog-url     https://mycompany.jfrog.io \
-        --jfrog-repo    nuget-local \
+        --jfrog-repo    libs-release-local \
         --jfrog-token   JFROG_ACCESS_TOKEN \
         --output        ./downloads
 
@@ -29,7 +31,7 @@ Optional flags:
     --until YYYY-MM-DD  Only migrate versions published on or before this date (UTC)
     --skip-download     Skip download phase (use already-downloaded files in --output)
     --skip-upload       Skip upload phase (dry-run download only)
-    --clean             Delete local .nupkg files after successful upload
+    --clean             Delete local files after successful upload
     --workers N         Parallel download/upload workers (default: 4)
     --retries N         HTTP retry attempts on transient errors (default: 3)
     --force             Re-upload even if artifact is recorded in the migration manifest
@@ -46,6 +48,9 @@ from _common import (
     azure_headers, check_jfrog_connection, filter_versions_by_date,
     jfrog_headers, MigrationManifest, request_with_retry, resolve_secret, safe_print,
 )
+
+# File extensions downloaded per package version
+_ARTIFACT_EXTENSIONS = ("jar", "pom")
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +75,15 @@ def get_all_packages(org: str, feed: str, headers: dict, project: str = None) ->
 
     while True:
         url = (f"{base}/packaging/feeds/{feed}/packages"
-               f"?api-version=7.1&$top={top}&$skip={skip}&includeAllVersions=true")
+               f"?protocolType=maven&api-version=7.1&$top={top}&$skip={skip}&includeAllVersions=true")
         r = request_with_retry("GET", url, headers=headers)
 
         if r.status_code == 401:
             print("ERROR: Azure auth failed. Check your PAT has 'Packaging (read)' scope.")
             sys.exit(1)
         if r.status_code == 404:
-            print(f"ERROR: Feed '{feed}' not found in org '{org}'.")
+            print(f"ERROR: Feed '{feed}' not found in org '{org}'"
+                  + (f", project '{project}'" if project else "") + ".")
             sys.exit(1)
         r.raise_for_status()
 
@@ -92,29 +98,52 @@ def get_all_packages(org: str, feed: str, headers: dict, project: str = None) ->
     return packages
 
 
-def download_nupkg(org: str, feed: str, name: str, version: str, output_dir: str,
-                   headers: dict, project: str = None, retries: int = 3) -> str | None:
-    """Download a .nupkg and return its local filepath, or None on failure."""
-    pkg_prefix = f"{org}/{project}" if project else org
-    url = (f"https://pkgs.dev.azure.com/{pkg_prefix}/_packaging/{feed}/nuget/v3/flat2"
-           f"/{name.lower()}/{version}/{name.lower()}.{version}.nupkg")
+def _parse_maven_name(name: str):
+    """Split 'groupId:artifactId' into (group_path, artifactId).
 
-    pkg_dir = os.path.join(output_dir, name, version)
+    'com.example:my-lib' → ('com/example', 'my-lib')
+    'my-lib'             → ('',            'my-lib')
+    """
+    if ":" in name:
+        group_id, artifact_id = name.split(":", 1)
+        return group_id.replace(".", "/"), artifact_id
+    return "", name
+
+
+def download_artifact(org: str, feed: str, name: str, version: str, ext: str,
+                      output_dir: str, headers: dict,
+                      project: str = None, retries: int = 3) -> str | None:
+    """Download one Maven artifact (.jar or .pom) and return its local path, or None."""
+    group_path, artifact_id = _parse_maven_name(name)
+    pkg_prefix = f"{org}/{project}" if project else org
+    filename = f"{artifact_id}-{version}.{ext}"
+
+    if group_path:
+        url = (f"https://pkgs.dev.azure.com/{pkg_prefix}/_packaging/{feed}/maven/v1"
+               f"/{group_path}/{artifact_id}/{version}/{filename}")
+        pkg_dir = os.path.join(output_dir, *group_path.split("/"), artifact_id, version)
+    else:
+        url = (f"https://pkgs.dev.azure.com/{pkg_prefix}/_packaging/{feed}/maven/v1"
+               f"/{artifact_id}/{version}/{filename}")
+        pkg_dir = os.path.join(output_dir, artifact_id, version)
+
     os.makedirs(pkg_dir, exist_ok=True)
-    filepath = os.path.join(pkg_dir, f"{name}.{version}.nupkg")
+    filepath = os.path.join(pkg_dir, filename)
 
     if os.path.exists(filepath):
-        safe_print(f"  [CACHED] {name}.{version}.nupkg")
+        safe_print(f"  [CACHED] {name}:{version} ({ext})")
         return filepath
 
     dl_headers = {**headers, "Accept": "application/octet-stream"}
     r = request_with_retry("GET", url, retries=retries, headers=dl_headers, stream=True)
 
     if r.status_code == 404:
-        safe_print(f"  [WARN]   {name}.{version}.nupkg — not found on Azure, skipping.")
+        # .jar is absent for pom-only (parent/BOM) artifacts — silent skip
+        if ext != "jar":
+            safe_print(f"  [WARN]   {name}:{version} ({ext}) — not found on Azure, skipping.")
         return None
     if not r.ok:
-        safe_print(f"  [WARN]   {name}.{version}.nupkg — HTTP {r.status_code}, skipping.")
+        safe_print(f"  [WARN]   {name}:{version} ({ext}) — HTTP {r.status_code}, skipping.")
         return None
 
     with open(filepath, "wb") as f:
@@ -122,12 +151,12 @@ def download_nupkg(org: str, feed: str, name: str, version: str, output_dir: str
             f.write(chunk)
 
     size_kb = os.path.getsize(filepath) / 1024
-    safe_print(f"  [OK]     {name}.{version}.nupkg ({size_kb:.1f} KB)")
+    safe_print(f"  [OK]     {name}:{version} ({ext}) ({size_kb:.1f} KB)")
     return filepath
 
 
 def run_download(args, az_hdrs) -> list[str]:
-    """Returns list of local .nupkg file paths."""
+    """Returns list of local file paths."""
     project = getattr(args, "az_project", None)
     packages = get_all_packages(args.az_org, args.az_feed, az_hdrs, project)
 
@@ -160,13 +189,14 @@ def run_download(args, az_hdrs) -> list[str]:
 
     def download_one(name: str, version: str):
         try:
-            fp = download_nupkg(args.az_org, args.az_feed, name, version,
-                                args.output, az_hdrs, project, args.retries)
-            if fp:
-                with collect_lock:
-                    local_files.append(fp)
+            for ext in _ARTIFACT_EXTENSIONS:
+                fp = download_artifact(args.az_org, args.az_feed, name, version, ext,
+                                       args.output, az_hdrs, project, args.retries)
+                if fp:
+                    with collect_lock:
+                        local_files.append(fp)
         except Exception as exc:
-            safe_print(f"  [ERROR]  {name}.{version}: {exc}")
+            safe_print(f"  [ERROR]  {name}:{version}: {exc}")
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(download_one, name, ver) for name, ver in tasks]
@@ -180,11 +210,11 @@ def run_download(args, az_hdrs) -> list[str]:
 # Phase 2 — Upload to JFrog Artifactory
 # ---------------------------------------------------------------------------
 
-def upload_nupkg(base_url: str, repo: str, filepath: str,
-                 headers: dict, retries: int = 3) -> bool:
-    """PUT a single .nupkg to JFrog. Returns True on success."""
-    filename = os.path.basename(filepath)
-    upload_url = f"{base_url.rstrip('/')}/artifactory/{repo}/{filename}"
+def upload_artifact(base_url: str, repo: str, filepath: str, output_dir: str,
+                    headers: dict, retries: int = 3) -> bool:
+    """Upload a Maven artifact to JFrog, preserving the Maven repository layout."""
+    relative = Path(filepath).relative_to(output_dir)
+    upload_url = f"{base_url.rstrip('/')}/artifactory/{repo}/{relative.as_posix()}"
 
     with open(filepath, "rb") as f:
         r = request_with_retry(
@@ -217,8 +247,7 @@ def run_upload(local_files: list[str], args, jfrog_hdrs,
     results_lock = threading.Lock()
 
     def upload_one(filepath: str):
-        filename = os.path.basename(filepath)
-        artifact_path = filename  # NuGet: flat repo layout
+        artifact_path = Path(filepath).relative_to(args.output).as_posix()
 
         with counter_lock:
             counter[0] += 1
@@ -230,7 +259,8 @@ def run_upload(local_files: list[str], args, jfrog_hdrs,
                 results.append("skipped")
             return
 
-        ok = upload_nupkg(args.jfrog_url, args.jfrog_repo, filepath, jfrog_hdrs, args.retries)
+        ok = upload_artifact(args.jfrog_url, args.jfrog_repo, filepath,
+                             args.output, jfrog_hdrs, args.retries)
         if ok:
             manifest.record(artifact_path)
             if args.clean:
@@ -262,8 +292,11 @@ def run_upload(local_files: list[str], args, jfrog_hdrs,
 # Collect already-downloaded files (for --skip-download mode)
 # ---------------------------------------------------------------------------
 
-def collect_local_nupkgs(output_dir: str) -> list[str]:
-    return [str(p) for p in Path(output_dir).rglob("*.nupkg")]
+def collect_local_artifacts(output_dir: str) -> list[str]:
+    results = []
+    for pattern in ("*.jar", "*.pom"):
+        results.extend(str(p) for p in Path(output_dir).rglob(pattern))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +305,7 @@ def collect_local_nupkgs(output_dir: str) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Migrate NuGet packages from Azure Artifacts to JFrog Artifactory."
+        description="Migrate Maven packages from Azure Artifacts to JFrog Artifactory."
     )
 
     parser.add_argument("--az-org",     required=True,  help="Azure DevOps organization name")
@@ -281,16 +314,16 @@ def main():
     parser.add_argument("--az-pat",     default=None,   help="Azure PAT — or set AZURE_PAT env var")
 
     parser.add_argument("--jfrog-url",   required=True, help="JFrog base URL, e.g. https://mycompany.jfrog.io")
-    parser.add_argument("--jfrog-repo",  required=True, help="JFrog NuGet local repo name, e.g. nuget-local")
+    parser.add_argument("--jfrog-repo",  required=True, help="JFrog Maven local repo name, e.g. libs-release-local")
     parser.add_argument("--jfrog-token", default=None,  help="JFrog Access Token — or set JFROG_TOKEN env var")
 
-    parser.add_argument("--output",        default="./downloads", help="Local folder for .nupkg files (default: ./downloads)")
+    parser.add_argument("--output",        default="./downloads", help="Local folder for downloaded files (default: ./downloads)")
     parser.add_argument("--latest-only",   action="store_true",   help="Only migrate the latest version of each package")
     parser.add_argument("--since",         default=None,          metavar="YYYY-MM-DD", help="Only migrate versions published on or after this date (UTC, inclusive)")
     parser.add_argument("--until",         default=None,          metavar="YYYY-MM-DD", help="Only migrate versions published on or before this date (UTC, inclusive)")
     parser.add_argument("--skip-download", action="store_true",   help="Skip download; upload files already in --output")
     parser.add_argument("--skip-upload",   action="store_true",   help="Skip upload (download only / dry run)")
-    parser.add_argument("--clean",         action="store_true",   help="Delete local .nupkg files after successful upload")
+    parser.add_argument("--clean",         action="store_true",   help="Delete local files after successful upload")
     parser.add_argument("--workers",       type=int, default=4,   help="Parallel download/upload workers (default: 4)")
     parser.add_argument("--retries",       type=int, default=3,   help="HTTP retry attempts on transient errors (default: 3)")
     parser.add_argument("--force",         action="store_true",   help="Re-upload even if already recorded in migration manifest")
@@ -298,8 +331,8 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    az_pat      = resolve_secret(args.az_pat,      "AZURE_PAT",    "Azure PAT")
-    jfrog_token = resolve_secret(args.jfrog_token, "JFROG_TOKEN",  "JFrog Access Token")
+    az_pat      = resolve_secret(args.az_pat,      "AZURE_PAT",   "Azure PAT")
+    jfrog_token = resolve_secret(args.jfrog_token, "JFROG_TOKEN", "JFrog Access Token")
 
     az_hdrs    = azure_headers(az_pat)
     jfrog_hdrs = jfrog_headers(jfrog_token)
@@ -307,14 +340,14 @@ def main():
 
     # --- Download phase ---
     if args.skip_download:
-        print("Skipping download phase. Scanning local output folder for .nupkg files...")
-        local_files = collect_local_nupkgs(args.output)
-        print(f"  Found {len(local_files)} local .nupkg file(s).")
+        print("Skipping download phase. Scanning local output folder for Maven artifacts...")
+        local_files = collect_local_artifacts(args.output)
+        print(f"  Found {len(local_files)} local artifact(s).")
     else:
         local_files = run_download(args, az_hdrs)
 
     if not local_files:
-        print("\nNo .nupkg files to upload. Exiting.")
+        print("\nNo artifacts to upload. Exiting.")
         sys.exit(0)
 
     # --- Upload phase ---
@@ -328,11 +361,11 @@ def main():
     # --- Summary ---
     print(f"\n{'='*60}")
     print("MIGRATION COMPLETE")
-    print(f"  Packages processed : {len(local_files)}")
-    print(f"  Uploaded           : {upload_succeeded}")
-    print(f"  Skipped (manifest) : {upload_skipped}")
-    print(f"  Failed             : {upload_failed}")
-    print(f"  Local folder       : {os.path.abspath(args.output)}")
+    print(f"  Artifacts processed : {len(local_files)}")
+    print(f"  Uploaded            : {upload_succeeded}")
+    print(f"  Skipped (manifest)  : {upload_skipped}")
+    print(f"  Failed              : {upload_failed}")
+    print(f"  Local folder        : {os.path.abspath(args.output)}")
     if args.clean and upload_succeeded:
         print(f"  Local files cleaned up after upload.")
     print(f"{'='*60}")
